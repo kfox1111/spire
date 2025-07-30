@@ -111,7 +111,7 @@ func (s *Server) run(ctx context.Context) (err error) {
 		TrustDomain: s.config.TrustDomain,
 	})
 
-	healthChecker := health.NewChecker(s.config.HealthChecks, s.config.Log, false)
+	healthChecker := health.NewChecker(s.config.HealthChecks, s.config.Log)
 
 	// Create the agent store host service. It will not be functional
 	// until the call to SetDeps() below.
@@ -213,7 +213,6 @@ func (s *Server) run(ctx context.Context) (err error) {
 		registrationManager.Run,
 		bundlePublishingManager.Run,
 		catalog.ReconfigureTask(s.config.Log.WithField(telemetry.SubsystemName, "reconfigurer"), cat),
-		healthChecker.ListenAndServe,
 	}
 
 	if s.config.LogReopener != nil {
@@ -225,11 +224,37 @@ func (s *Server) run(ctx context.Context) (err error) {
 		tasks = append(tasks, nodeManager.Run)
 	}
 
-	err = util.RunTasks(ctx, tasks...)
-	if errors.Is(err, context.Canceled) {
-		err = nil
+	errChan := make(chan error)
+	go func() {
+		if err := util.RunTasks(ctx, tasks...); err != nil {
+			errChan <- err
+		}
+	}()
+
+	endpointsServer.(*endpoints.Endpoints).WaitForListening()
+
+	go func() {
+		tasks := []func(context.Context) error{
+			healthChecker.ListenAndServe,
+		}
+		if err := util.RunTasks(ctx, tasks...); err != nil {
+			errChan <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Context was canceled, we can exit gracefully
+		return nil
+	case err := <-errChan:
+		// An error occurred while running
+		// the tasks, we need to return it
+		if errors.Is(err, context.Canceled) {
+			// Context was canceled, we can exit gracefully
+			return nil
+		}
+		return err
 	}
-	return err
 }
 
 func (s *Server) setupProfiling(ctx context.Context) (stop func()) {

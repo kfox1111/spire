@@ -98,17 +98,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	defer cat.Close()
 
-	healthChecker := health.NewChecker(a.c.HealthChecks, a.c.Log, true)
-	if err := healthChecker.AddCheck("agent", a); err != nil {
-		return fmt.Errorf("failed adding healthcheck: %w", err)
-	}
-	tasks := []func(context.Context) error{
-		healthChecker.ListenAndServe,
-		metrics.ListenAndServe,
-	}
-	taskRunner := util.NewTaskRunner(ctx, cancel)
-	taskRunner.StartTasks(tasks...)
-
 	nodeAttestor := nodeattestor.JoinToken(a.c.Log, a.c.JoinToken)
 	if a.c.JoinToken == "" {
 		nodeAttestor = cat.GetNodeAttestor()
@@ -187,32 +176,61 @@ func (a *Agent) Run(ctx context.Context) error {
 		Metrics: metrics,
 	})
 
-	endpoints := a.newEndpoints(metrics, manager, workloadAttestor)
+	agentEndponts := a.newEndpoints(metrics, manager, workloadAttestor)
 
 	a.started = true
-	tasks = []func(context.Context) error{
-		manager.Run,
-		storeService.Run,
-		endpoints.ListenAndServe,
-		catalog.ReconfigureTask(a.c.Log.WithField(telemetry.SubsystemName, "reconfigurer"), cat),
-	}
 
-	if a.c.AdminBindAddress != nil {
-		adminEndpoints := a.newAdminEndpoints(metrics, manager, workloadAttestor, a.c.AuthorizedDelegates)
-		tasks = append(tasks, adminEndpoints.ListenAndServe)
-	}
+	errChan := make(chan error)
 
-	if a.c.LogReopener != nil {
-		tasks = append(tasks, a.c.LogReopener)
-	}
+	go func() {
+		tasks := []func(context.Context) error{
+			manager.Run,
+			storeService.Run,
+			agentEndponts.ListenAndServe,
+			catalog.ReconfigureTask(a.c.Log.WithField(telemetry.SubsystemName, "reconfigurer"), cat),
+		}
 
-	healthChecker.StartupComplete()
-	taskRunner.StartTasks(tasks...)
-	err = taskRunner.Wait()
-	if errors.Is(err, context.Canceled) {
-		err = nil
+		if a.c.AdminBindAddress != nil {
+			adminEndpoints := a.newAdminEndpoints(metrics, manager, workloadAttestor, a.c.AuthorizedDelegates)
+			tasks = append(tasks, adminEndpoints.ListenAndServe)
+		}
+
+		if a.c.LogReopener != nil {
+			tasks = append(tasks, a.c.LogReopener)
+		}
+		if err := util.RunTasks(ctx, tasks...); err != nil {
+			errChan <- err
+		}
+	}()
+
+	agentEndponts.(*endpoints.Endpoints).WaitForListening()
+	healthChecker := health.NewChecker(a.c.HealthChecks, a.c.Log)
+	if err := healthChecker.AddCheck("agent", a); err != nil {
+		return fmt.Errorf("failed adding healthcheck: %w", err)
 	}
-	return err
+	go func() {
+		tasks := []func(context.Context) error{
+			healthChecker.ListenAndServe,
+			metrics.ListenAndServe,
+		}
+		if err := util.RunTasks(ctx, tasks...); err != nil {
+			errChan <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Context was canceled, we can exit gracefully
+		return nil
+	case err := <-errChan:
+		// An error occurred while running
+		// the tasks, we need to return it
+		if errors.Is(err, context.Canceled) {
+			// Context was canceled, we can exit gracefully
+			return nil
+		}
+		return err
+	}
 }
 
 func (a *Agent) setupProfiling(ctx context.Context) (stop func()) {
