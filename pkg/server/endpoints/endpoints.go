@@ -94,6 +94,11 @@ type Endpoints struct {
 	AuthPolicyEngine             *authpolicy.Engine
 	AdminIDs                     []spiffeid.ID
 	TLSPolicy                    tlspolicy.Policy
+
+	hooks struct {
+		// test hook used to indicate that is listening
+		listening chan struct{}
+	}
 }
 
 type APIServers struct {
@@ -205,6 +210,11 @@ func New(ctx context.Context, c Config) (*Endpoints, error) {
 		AuthPolicyEngine:             c.AuthPolicyEngine,
 		AdminIDs:                     c.AdminIDs,
 		TLSPolicy:                    c.TLSPolicy,
+		hooks: struct {
+			listening chan struct{}
+		}{
+			listening: make(chan struct{}),
+		},
 	}, nil
 }
 
@@ -352,6 +362,7 @@ func (e *Endpoints) runLocalAccess(ctx context.Context, server *grpc.Server) err
 
 	// Skip use of tomb here so we don't pollute a clean shutdown with errors
 	log.Info("Starting Server APIs")
+	e.triggerListeningHook()
 	errChan := make(chan error)
 	go func() { errChan <- server.Serve(l) }()
 
@@ -420,4 +431,14 @@ func (e *Endpoints) makeInterceptors() (grpc.UnaryServerInterceptor, grpc.Stream
 	log := e.Log.WithField(telemetry.SubsystemName, "api")
 
 	return middleware.Interceptors(Middleware(log, e.Metrics, e.DataStore, clock.New(), e.RateLimit, e.AuthPolicyEngine, e.AuditLogEnabled, e.AdminIDs))
+}
+
+func (e *Endpoints) triggerListeningHook() {
+	if e.hooks.listening != nil {
+		e.hooks.listening <- struct{}{}
+	}
+}
+
+func (e *Endpoints) WaitForListening() {
+	<-e.hooks.listening
 }

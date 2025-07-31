@@ -90,6 +90,11 @@ func New(c Config) *Endpoints {
 		workloadAPIServer: workloadAPIServer,
 		sdsv3Server:       sdsv3Server,
 		healthServer:      healthServer,
+		hooks: struct {
+			listening chan struct{}
+		}{
+			listening: make(chan struct{}),
+		},
 	}
 }
 
@@ -146,4 +151,9 @@ func (e *Endpoints) triggerListeningHook() {
 	if e.hooks.listening != nil {
 		e.hooks.listening <- struct{}{}
 	}
+}
+
+func (e *Endpoints) Listening(listening chan struct{}) {
+	<-e.hooks.listening
+	listening <- struct{}{}
 }
